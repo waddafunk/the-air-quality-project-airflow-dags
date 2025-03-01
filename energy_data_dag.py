@@ -1,10 +1,11 @@
 from airflow import DAG
-from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 import os
 import pandas as pd
+import requests
 from azure.storage.filedatalake import DataLakeServiceClient
+from azure.identity import DefaultAzureCredential
 
 default_args = {
     "owner": "airflow",
@@ -22,6 +23,28 @@ dag = DAG(
     schedule_interval="@monthly",
 )
 
+# Define the function to download energy data
+def download_energy_data(**context):
+    """Download energy data from the specified URL"""
+    from airflow.models import Variable
+    
+    # Get the URL from Airflow variables
+    energy_data_url = Variable.get("energy_data_url")
+    
+    # Create the file path using the execution date
+    file_path = f"/tmp/energy_data_{context['ds']}.csv"
+    
+    # Download the file
+    response = requests.get(energy_data_url, stream=True)
+    response.raise_for_status()  # Raise an exception for HTTP errors
+    
+    # Write the content to a file
+    with open(file_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+    
+    print(f"Successfully downloaded energy data to {file_path}")
+    return file_path
 
 # Define the function to upload to Azure Data Lake
 def upload_to_datalake(ti, **kwargs):
@@ -32,17 +55,19 @@ def upload_to_datalake(ti, **kwargs):
     energy_df = pd.read_csv(downloaded_file_path)
     print(f"Read {len(energy_df)} rows from energy data file")
 
-    # Get environment variables
-    prefix = os.environ["PREFIX"].replace("-", "")
-
-    # Storage account parameters
-    STORAGE_ACCOUNT_NAME = prefix + "dlsdev"
+    # Storage account parameters - use a fixed name based on infrastructure naming pattern
+    STORAGE_ACCOUNT_NAME = "airqualitykubedlsdev"
     CONTAINER_NAME = "curated"
 
-    # Initialize Data Lake client
+    # Initialize Data Lake client with DefaultAzureCredential for workload identity
+    credential = DefaultAzureCredential()
+    
+    # Add debugging information
+    print(f"Using DefaultAzureCredential to authenticate with {STORAGE_ACCOUNT_NAME}")
+    
     service_client = DataLakeServiceClient(
         account_url=f"https://{STORAGE_ACCOUNT_NAME}.dfs.core.windows.net",
-        credential=os.environ["DATA_LAKE_KEY"],
+        credential=credential,
     )
     file_system_client = service_client.get_file_system_client(
         file_system=CONTAINER_NAME
@@ -63,14 +88,11 @@ def upload_to_datalake(ti, **kwargs):
     print(f"Successfully uploaded CSV to {CONTAINER_NAME}/{file_path}")
     return file_path
 
-
-# Task 1: Download the CSV using BashOperator
-download_task = BashOperator(
+# Task 1: Download the CSV using PythonOperator
+download_task = PythonOperator(
     task_id="download_energy_data",
-    bash_command='wget -O /tmp/energy_data_{{ ds }}.csv $ENERGY_DATA_URL && echo "/tmp/energy_data_{{ ds }}.csv"',
-    env={
-        "ENERGY_DATA_URL": "{{ var.value.energy_data_url }}",
-    },
+    python_callable=download_energy_data,
+    provide_context=True,
     dag=dag,
 )
 
