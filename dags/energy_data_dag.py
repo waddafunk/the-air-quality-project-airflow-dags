@@ -57,7 +57,7 @@ def upload_to_datalake(ti, **kwargs):
     print(f"Read {len(energy_df)} rows from energy data file")
 
     # Storage account parameters - use a fixed name based on infrastructure naming pattern
-    STORAGE_ACCOUNT_NAME = os.environ["PREFIX"] + "dls" + os.environ["ENV"]
+    STORAGE_ACCOUNT_NAME = os.environ["PREFIX"] + "dls" + os.environ["ENVIRONMENT"]
     STORAGE_ACCOUNT_NAME = STORAGE_ACCOUNT_NAME.replace("-", "")
     CONTAINER_NAME = "curated"
 
