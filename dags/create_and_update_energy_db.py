@@ -279,10 +279,11 @@ def upload_energy_data(**context):
 with DAG(
     'create_and_update_energy_database',
     default_args=default_args,
-    description='Creates the energy database if it does not exist',
+    description='Creates the energy database if it does not exist and updates its tables',
     schedule=timedelta(days=3*31), 
     start_date=datetime(2023, 1, 1),
     catchup=False,
+    tags=["energy", "etl", "data-warehouse"]
 ) as dag:
     
     # Task to create the database
