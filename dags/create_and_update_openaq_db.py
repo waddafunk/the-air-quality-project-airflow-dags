@@ -5,8 +5,7 @@ from airflow.operators.python import PythonOperator
 import os
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
-import requests
-from openaq import OpenAQv3Collector
+from .utils.openaq import OpenAQv3Collector
 
 default_args = {
     "owner": "airflow",
