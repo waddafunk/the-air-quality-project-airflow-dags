@@ -84,6 +84,16 @@ def upload_openaq_data(**context):
     countries_data = pd.read_csv(countries_path)
     locations_data = pd.read_csv(locations_path)
 
+    # Print column names to debug
+    print(f"Countries columns: {list(countries_data.columns)}")
+    print(f"Locations columns: {list(locations_data.columns)}")
+    
+    # Sample data to verify structure
+    print("Sample countries data:")
+    print(countries_data.head(2).to_string())
+    print("Sample locations data:")
+    print(locations_data.head(2).to_string())
+
     # Ensure we have a date column for tracking updates
     if "execution_date" not in countries_data.columns:
         countries_data["execution_date"] = execution_date
@@ -174,82 +184,131 @@ def upload_openaq_data(**context):
     conn.commit()
     print(f"Processed {len(countries_data)} countries")
 
+    # Check what country IDs exist in the database for verification
+    cursor.execute("SELECT id FROM countries")
+    db_country_ids = [row[0] for row in cursor.fetchall()]
+    print(f"Number of countries in database: {len(db_country_ids)}")
+    print(f"First few country IDs in database: {db_country_ids[:5]}")
+
     # Process locations data
+    locations_inserted = 0
+    locations_updated = 0
+    locations_skipped = 0
+    foreign_key_errors = 0
+
     for _, row in locations_data.iterrows():
-        # Prepare data for insertion, handling potential missing columns
-        location_id = str(row.get("id", ""))
-        location_name = str(row.get("name", ""))
-        city = str(row.get("city", ""))
-        country_id = str(row.get("country_id", ""))
-
-        # Try to get latitude and longitude, defaulting to None if not available
         try:
-            latitude = float(row.get("latitude", None))
-        except (ValueError, TypeError):
-            latitude = None
+            # Prepare data for insertion, handling potential missing columns
+            location_id = str(row.get("id", ""))
+            location_name = str(row.get("name", ""))
+            city = str(row.get("city", ""))
+            
+            # Check which column contains the country ID
+            if "country_id" in row:
+                country_id = str(row.get("country_id", ""))
+            elif "countryId" in row:
+                country_id = str(row.get("countryId", ""))
+            else:
+                # Try to find any column that might contain the country ID
+                possible_country_id_columns = [col for col in row.index if "country" in col.lower()]
+                if possible_country_id_columns:
+                    country_id = str(row.get(possible_country_id_columns[0], ""))
+                else:
+                    print(f"Could not find country ID column for location {location_id}")
+                    locations_skipped += 1
+                    continue
 
-        try:
-            longitude = float(row.get("longitude", None))
-        except (ValueError, TypeError):
-            longitude = None
+            # Try to get latitude and longitude, defaulting to None if not available
+            try:
+                latitude = float(row.get("latitude", None))
+            except (ValueError, TypeError):
+                latitude = None
 
-        # Skip if any of the required fields are missing
-        if not location_id or not country_id:
-            continue
+            try:
+                longitude = float(row.get("longitude", None))
+            except (ValueError, TypeError):
+                longitude = None
 
-        # Check if this location already exists
-        cursor.execute("SELECT 1 FROM locations WHERE id = %s", (location_id,))
-        exists = cursor.fetchone()
+            # Skip if any of the required fields are missing
+            if not location_id or not country_id:
+                locations_skipped += 1
+                continue
 
-        if exists:
-            # Update existing record
-            update_query = """
-            UPDATE locations 
-            SET name = %s, city = %s, country_id = %s, latitude = %s, longitude = %s, 
-                execution_date = %s, updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-            """
-            cursor.execute(
-                update_query,
-                (
-                    location_name,
-                    city,
-                    country_id,
-                    latitude,
-                    longitude,
-                    execution_date,
-                    location_id,
-                ),
-            )
-        else:
-            # Insert new record
-            insert_query = """
-            INSERT INTO locations (id, name, city, country_id, latitude, longitude, execution_date)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """
-            cursor.execute(
-                insert_query,
-                (
-                    location_id,
-                    location_name,
-                    city,
-                    country_id,
-                    latitude,
-                    longitude,
-                    execution_date,
-                ),
-            )
+            # Verify the country ID exists in the database
+            if country_id not in db_country_ids:
+                print(f"Country ID {country_id} for location {location_id} not found in countries table")
+                foreign_key_errors += 1
+                continue
 
-    # Commit locations data
-    conn.commit()
-    print(f"Processed {len(locations_data)} locations")
+            # Check if this location already exists
+            cursor.execute("SELECT 1 FROM locations WHERE id = %s", (location_id,))
+            exists = cursor.fetchone()
+
+            if exists:
+                # Update existing record
+                update_query = """
+                UPDATE locations 
+                SET name = %s, city = %s, country_id = %s, latitude = %s, longitude = %s, 
+                    execution_date = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """
+                cursor.execute(
+                    update_query,
+                    (
+                        location_name,
+                        city,
+                        country_id,
+                        latitude,
+                        longitude,
+                        execution_date,
+                        location_id,
+                    ),
+                )
+                locations_updated += 1
+            else:
+                # Insert new record
+                insert_query = """
+                INSERT INTO locations (id, name, city, country_id, latitude, longitude, execution_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """
+                cursor.execute(
+                    insert_query,
+                    (
+                        location_id,
+                        location_name,
+                        city,
+                        country_id,
+                        latitude,
+                        longitude,
+                        execution_date,
+                    ),
+                )
+                locations_inserted += 1
+
+            # Commit after each successful operation to avoid losing all data on a single error
+            conn.commit()
+            
+        except Exception as e:
+            print(f"Error processing location {row.get('id', 'unknown')}: {str(e)}")
+            conn.rollback()
+            locations_skipped += 1
+
+    # Verify locations were inserted
+    cursor.execute("SELECT COUNT(*) FROM locations")
+    locations_count = cursor.fetchone()[0]
+    
+    print(f"Locations processed: {len(locations_data)}")
+    print(f"Locations inserted: {locations_inserted}")
+    print(f"Locations updated: {locations_updated}")
+    print(f"Locations skipped: {locations_skipped}")
+    print(f"Foreign key errors: {foreign_key_errors}")
+    print(f"Total locations in database: {locations_count}")
 
     # Close cursor and connection
     cursor.close()
     conn.close()
 
     print("Upload to database completed successfully")
-
 
 # Define the DAG
 with DAG(
