@@ -6,6 +6,7 @@ import os
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from utils.openaq import OpenAQv3Collector
+import json
 
 default_args = {
     "owner": "airflow",
@@ -88,6 +89,20 @@ def upload_openaq_data(**context):
     print(f"Countries columns: {list(countries_data.columns)}")
     print(f"Locations columns: {list(locations_data.columns)}")
     
+    # Clean up column names - replace spaces, colons and other problematic characters
+    countries_data.columns = [col.replace(":", "_").replace(" ", "_").replace(".", "_").lower() 
+                             for col in countries_data.columns]
+    locations_data.columns = [col.replace(":", "_").replace(" ", "_").replace(".", "_").lower() 
+                             for col in locations_data.columns]
+    
+    # Drop 'unnamed' columns if they exist
+    countries_data = countries_data.loc[:, ~countries_data.columns.str.contains('^unnamed')]
+    locations_data = locations_data.loc[:, ~locations_data.columns.str.contains('^unnamed')]
+    
+    # Print cleaned column names
+    print(f"Cleaned countries columns: {list(countries_data.columns)}")
+    print(f"Cleaned locations columns: {list(locations_data.columns)}")
+    
     # Add execution date column for tracking when data was loaded
     countries_data["execution_date"] = execution_date
     locations_data["execution_date"] = execution_date
@@ -106,58 +121,49 @@ def upload_openaq_data(**context):
     cursor = conn.cursor()
 
     try:
-        # STEP 1: Create the tables dynamically based on CSV columns
+        # STEP 1: Create the tables with fixed schema based on our knowledge of the data
         
-        # For countries table
-        countries_columns = list(countries_data.columns)
-        countries_columns_sql = []
-        
-        # Ensure 'id' is the primary key
-        countries_columns_sql.append("id VARCHAR(255) PRIMARY KEY")
-        
-        # Add remaining columns (excluding 'id' and execution_date which we already handled)
-        for col in countries_columns:
-            if col not in ['id', 'execution_date']:
-                countries_columns_sql.append(f"{col} VARCHAR(255)")
-        
-        # Add execution_date column
-        countries_columns_sql.append("execution_date DATE")
-        countries_columns_sql.append("updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-        
-        # Create countries table
-        create_countries_table_query = f"""
+        # For countries table - create a simple schema
+        create_countries_table_query = """
         CREATE TABLE IF NOT EXISTS countries (
-            {', '.join(countries_columns_sql)}
+            id VARCHAR(255) PRIMARY KEY,
+            code VARCHAR(10),
+            name VARCHAR(255),
+            datetimefirst VARCHAR(255),
+            datetimelast VARCHAR(255),
+            parameters TEXT,
+            execution_date DATE,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
         cursor.execute(create_countries_table_query)
         
-        # For locations table
-        locations_columns = list(locations_data.columns)
-        locations_columns_sql = []
+        # For locations table - identify the country ID column
+        country_id_col = None
+        for col in locations_data.columns:
+            if 'country_id' in col:
+                country_id_col = col
+                break
         
-        # Ensure 'id' is the primary key
-        locations_columns_sql.append("id VARCHAR(255) PRIMARY KEY")
+        if not country_id_col:
+            print("WARNING: Could not find country_id column in locations data")
+            country_id_col = 'country_id'  # Default name if not found
         
-        # Add remaining columns with appropriate data types
-        for col in locations_columns:
-            if col == 'id' or col == 'execution_date':
-                continue  # Already handled
-            elif col in ['latitude', 'longitude']:
-                locations_columns_sql.append(f"{col} FLOAT")
-            elif col == 'country_id':
-                locations_columns_sql.append(f"{col} VARCHAR(255) REFERENCES countries(id)")
-            else:
-                locations_columns_sql.append(f"{col} VARCHAR(255)")
-        
-        # Add execution_date column
-        locations_columns_sql.append("execution_date DATE")
-        locations_columns_sql.append("updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-        
-        # Create locations table
-        create_locations_table_query = f"""
+        # Create locations table with a foreign key to countries
+        create_locations_table_query = """
         CREATE TABLE IF NOT EXISTS locations (
-            {', '.join(locations_columns_sql)}
+            id VARCHAR(255) PRIMARY KEY,
+            name VARCHAR(255),
+            locality VARCHAR(255),
+            timezone VARCHAR(50),
+            ismobile BOOLEAN,
+            ismonitor BOOLEAN,
+            country_id VARCHAR(255) REFERENCES countries(id),
+            latitude FLOAT,
+            longitude FLOAT,
+            execution_date DATE,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            metadata JSONB  -- Store additional fields as JSON
         );
         """
         cursor.execute(create_locations_table_query)
@@ -178,27 +184,16 @@ def upload_openaq_data(**context):
                 
             country_id = str(row['id'])
             
-            # Prepare column names and values for this row
-            columns = []
-            placeholders = []
-            values = []
-            update_pairs = []
-            
-            for col in countries_data.columns:
-                if not pd.isna(row[col]):  # Skip NULL values
-                    columns.append(col)
-                    placeholders.append('%s')
-                    values.append(str(row[col]))
-                    
-                    if col != 'id':  # For UPDATE statement
-                        update_pairs.append(f"{col} = %s")
-            
-            # Add execution_date if not already present
-            if 'execution_date' not in columns:
-                columns.append('execution_date')
-                placeholders.append('%s')
-                values.append(execution_date)
-                update_pairs.append("execution_date = %s")
+            # Extract standard fields
+            country_values = {
+                'id': country_id,
+                'code': str(row.get('code', '')) if not pd.isna(row.get('code', None)) else '',
+                'name': str(row.get('name', '')) if not pd.isna(row.get('name', None)) else '',
+                'datetimefirst': str(row.get('datetimefirst', '')) if not pd.isna(row.get('datetimefirst', None)) else '',
+                'datetimelast': str(row.get('datetimelast', '')) if not pd.isna(row.get('datetimelast', None)) else '',
+                'parameters': str(row.get('parameters', '')) if not pd.isna(row.get('parameters', None)) else '',
+                'execution_date': execution_date
+            }
             
             # Check if country exists
             cursor.execute("SELECT 1 FROM countries WHERE id = %s", (country_id,))
@@ -207,23 +202,37 @@ def upload_openaq_data(**context):
             try:
                 if exists:
                     # Update existing country
-                    update_values = [val for i, val in enumerate(values) if columns[i] != 'id']
-                    update_values.append(country_id)  # Add id for WHERE clause
-                    
-                    update_query = f"""
+                    update_query = """
                     UPDATE countries 
-                    SET {', '.join(update_pairs)}, updated_at = CURRENT_TIMESTAMP
+                    SET code = %s, name = %s, datetimefirst = %s, datetimelast = %s, 
+                        parameters = %s, execution_date = %s, updated_at = CURRENT_TIMESTAMP
                     WHERE id = %s
                     """
-                    cursor.execute(update_query, update_values)
+                    cursor.execute(update_query, (
+                        country_values['code'],
+                        country_values['name'],
+                        country_values['datetimefirst'],
+                        country_values['datetimelast'],
+                        country_values['parameters'],
+                        country_values['execution_date'],
+                        country_id
+                    ))
                     countries_updated += 1
                 else:
                     # Insert new country
-                    insert_query = f"""
-                    INSERT INTO countries ({', '.join(columns)})
-                    VALUES ({', '.join(placeholders)})
+                    insert_query = """
+                    INSERT INTO countries (id, code, name, datetimefirst, datetimelast, parameters, execution_date)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """
-                    cursor.execute(insert_query, values)
+                    cursor.execute(insert_query, (
+                        country_values['id'],
+                        country_values['code'],
+                        country_values['name'],
+                        country_values['datetimefirst'],
+                        country_values['datetimelast'],
+                        country_values['parameters'],
+                        country_values['execution_date']
+                    ))
                     countries_inserted += 1
             except Exception as e:
                 print(f"Error processing country {country_id}: {str(e)}")
@@ -245,6 +254,23 @@ def upload_openaq_data(**context):
         cursor.execute("SELECT id FROM countries")
         db_country_ids = set(row[0] for row in cursor.fetchall())
         
+        # Find the proper country and coordinate columns
+        country_id_column = None
+        lat_column = None
+        lon_column = None
+        
+        for col in locations_data.columns:
+            if 'country_id' in col.lower():
+                country_id_column = col
+            elif 'latitude' in col.lower() or 'coordinates_latitude' in col.lower():
+                lat_column = col
+            elif 'longitude' in col.lower() or 'coordinates_longitude' in col.lower():
+                lon_column = col
+        
+        print(f"Using country_id column: {country_id_column}")
+        print(f"Using latitude column: {lat_column}")
+        print(f"Using longitude column: {lon_column}")
+        
         for _, row in locations_data.iterrows():
             # Skip if id is missing
             if pd.isna(row.get('id', None)):
@@ -253,38 +279,54 @@ def upload_openaq_data(**context):
                 
             location_id = str(row['id'])
             
-            # Check for the country_id column
+            # Extract country_id from the appropriate column
             country_id = None
-            if 'country_id' in row and not pd.isna(row['country_id']):
-                country_id = str(row['country_id'])
+            if country_id_column and country_id_column in row and not pd.isna(row[country_id_column]):
+                country_id = str(row[country_id_column])
             
             # Skip if country_id is missing or not in the database
             if not country_id or country_id not in db_country_ids:
                 print(f"Skipping location {location_id}: country_id {country_id} not found in countries table")
                 locations_skipped += 1
                 continue
+                
+            # Extract coordinates
+            latitude = None
+            longitude = None
             
-            # Prepare column names and values for this row
-            columns = []
-            placeholders = []
-            values = []
-            update_pairs = []
-            
-            for col in locations_data.columns:
-                if not pd.isna(row[col]):  # Skip NULL values
-                    columns.append(col)
-                    placeholders.append('%s')
-                    values.append(str(row[col]))
+            if lat_column and lat_column in row and not pd.isna(row[lat_column]):
+                try:
+                    latitude = float(row[lat_column])
+                except (ValueError, TypeError):
+                    pass
                     
-                    if col != 'id':  # For UPDATE statement
-                        update_pairs.append(f"{col} = %s")
+            if lon_column and lon_column in row and not pd.isna(row[lon_column]):
+                try:
+                    longitude = float(row[lon_column])
+                except (ValueError, TypeError):
+                    pass
             
-            # Add execution_date if not already present
-            if 'execution_date' not in columns:
-                columns.append('execution_date')
-                placeholders.append('%s')
-                values.append(execution_date)
-                update_pairs.append("execution_date = %s")
+            # Store non-standard fields as JSON
+            metadata = {}
+            for col in locations_data.columns:
+                if col not in ['id', 'name', 'locality', 'timezone', 'ismobile', 'ismonitor', 
+                               country_id_column, lat_column, lon_column, 'execution_date'] and not pd.isna(row[col]):
+                    metadata[col] = str(row[col])
+            
+            # Basic location fields
+            location_values = {
+                'id': location_id,
+                'name': str(row.get('name', '')) if not pd.isna(row.get('name', None)) else '',
+                'locality': str(row.get('locality', '')) if not pd.isna(row.get('locality', None)) else '',
+                'timezone': str(row.get('timezone', '')) if not pd.isna(row.get('timezone', None)) else '',
+                'ismobile': bool(row.get('ismobile', False)) if not pd.isna(row.get('ismobile', None)) else False,
+                'ismonitor': bool(row.get('ismonitor', False)) if not pd.isna(row.get('ismonitor', None)) else False,
+                'country_id': country_id,
+                'latitude': latitude,
+                'longitude': longitude,
+                'execution_date': execution_date,
+                'metadata': json.dumps(metadata)
+            }
             
             # Check if location exists
             cursor.execute("SELECT 1 FROM locations WHERE id = %s", (location_id,))
@@ -293,23 +335,47 @@ def upload_openaq_data(**context):
             try:
                 if exists:
                     # Update existing location
-                    update_values = [val for i, val in enumerate(values) if columns[i] != 'id']
-                    update_values.append(location_id)  # Add id for WHERE clause
-                    
-                    update_query = f"""
+                    update_query = """
                     UPDATE locations 
-                    SET {', '.join(update_pairs)}, updated_at = CURRENT_TIMESTAMP
+                    SET name = %s, locality = %s, timezone = %s, ismobile = %s, ismonitor = %s,
+                        country_id = %s, latitude = %s, longitude = %s, execution_date = %s,
+                        metadata = %s, updated_at = CURRENT_TIMESTAMP
                     WHERE id = %s
                     """
-                    cursor.execute(update_query, update_values)
+                    cursor.execute(update_query, (
+                        location_values['name'],
+                        location_values['locality'],
+                        location_values['timezone'],
+                        location_values['ismobile'],
+                        location_values['ismonitor'],
+                        location_values['country_id'],
+                        location_values['latitude'],
+                        location_values['longitude'],
+                        location_values['execution_date'],
+                        location_values['metadata'],
+                        location_id
+                    ))
                     locations_updated += 1
                 else:
                     # Insert new location
-                    insert_query = f"""
-                    INSERT INTO locations ({', '.join(columns)})
-                    VALUES ({', '.join(placeholders)})
+                    insert_query = """
+                    INSERT INTO locations (id, name, locality, timezone, ismobile, ismonitor,
+                                          country_id, latitude, longitude, execution_date, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """
-                    cursor.execute(insert_query, values)
+                    cursor.execute(insert_query, (
+                        location_values['id'],
+                        location_values['name'],
+                        location_values['locality'],
+                        location_values['timezone'],
+                        location_values['ismobile'],
+                        location_values['ismonitor'],
+                        location_values['country_id'],
+                        location_values['latitude'],
+                        location_values['longitude'],
+                        location_values['execution_date'],
+                        location_values['metadata']
+                    ))
                     locations_inserted += 1
                 
                 # Commit after each successful operation
@@ -344,6 +410,7 @@ def upload_openaq_data(**context):
         conn.close()
     
     print("Upload to database completed successfully")
+
 # Define the DAG
 with DAG(
     "create_and_update_openaq_database",
