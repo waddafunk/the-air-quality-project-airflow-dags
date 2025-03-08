@@ -280,7 +280,7 @@ with DAG(
     'create_and_update_energy_database',
     default_args=default_args,
     description='Creates the energy database if it does not exist',
-    schedule=timedelta(monts=3),  # Updated from schedule_interval to schedule
+    schedule=timedelta(days=3*31), 
     start_date=datetime(2023, 1, 1),
     catchup=False,
 ) as dag:
@@ -294,13 +294,11 @@ with DAG(
     download_task = PythonOperator(
         task_id="download_energy_data",
         python_callable=download_energy_data,
-        # provide_context=True is no longer needed in Airflow 2.0+
     )
     
     upload_task = PythonOperator(
         task_id="upload_energy_data",
         python_callable=upload_energy_data,
-        # provide_context=True is no longer needed in Airflow 2.0+
     )
     
     # Set task dependencies
