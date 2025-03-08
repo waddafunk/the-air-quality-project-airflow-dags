@@ -280,7 +280,7 @@ with DAG(
     'create_and_update_energy_database',
     default_args=default_args,
     description='Creates the energy database if it does not exist',
-    schedule=timedelta(days=1),  # Updated from schedule_interval to schedule
+    schedule=timedelta(monts=3),  # Updated from schedule_interval to schedule
     start_date=datetime(2023, 1, 1),
     catchup=False,
 ) as dag:
