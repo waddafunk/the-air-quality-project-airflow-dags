@@ -87,8 +87,18 @@ def upload_energy_data(**context):
     
     # Ensure we have a date column for tracking updates
     # If the data doesn't have a date column already, add the execution date
-    if 'date' not in energy_data.columns:
-        energy_data['date'] = execution_date
+    if 'execution_date' not in energy_data.columns:
+        energy_data['execution_date'] = execution_date
+        
+    share_data = [
+        col
+        for col in energy_data.columns
+        if "share" in col
+        and "demand" not in col
+        and "energy" in col
+        and "renewables" not in col
+        and 'fossil' not in col
+    ]
     
     # Get PostgreSQL connection details from environment variables
     pg_host = os.environ.get('POSTGRES_HOST')
@@ -115,6 +125,12 @@ def upload_energy_data(**context):
         sanitized_country = re.sub(r'[^\w]', '_', country.lower())
         table_name = f"energy_{sanitized_country}"
         
+        not_all_nans = df[share_data].apply(lambda x: not x.isna().any(), axis=1)
+        df = df[not_all_nans]
+        
+        if len(df) == 0: # don't process if we don't have energy share data
+            continue
+
         # Check if table exists
         cursor.execute(f"""
             SELECT EXISTS (
