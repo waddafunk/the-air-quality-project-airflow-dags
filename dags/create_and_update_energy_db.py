@@ -73,7 +73,7 @@ def download_energy_data(**context):
     return file_path
 
 def upload_energy_data(**context):
-    """Upload energy data to PostgreSQL database by country with incremental updates"""
+    """Upload energy data to PostgreSQL database by country with simple replace logic"""
     print("Starting upload_energy_data function")
     # Retrieve file path from previous task
     ti = context['ti']
@@ -125,154 +125,90 @@ def upload_energy_data(**context):
         """)
         table_exists = cursor.fetchone()[0]
         
-        # If table doesn't exist, create it
-        if not table_exists:
-            # Get column names and types from DataFrame
-            columns = []
-            for col_name, dtype in zip(df.columns, df.dtypes):
-                # Map pandas dtypes to PostgreSQL types
-                if 'int' in str(dtype):
-                    pg_type = 'INTEGER'
-                elif 'float' in str(dtype):
-                    pg_type = 'FLOAT'
-                elif 'datetime' in str(dtype):
-                    pg_type = 'TIMESTAMP'
-                else:
-                    pg_type = 'TEXT'
-                columns.append(f"\"{col_name}\" {pg_type}")
-            
-            # Add a unique identifier column for updates if not already present
-            if 'id' not in df.columns:
-                columns.append("id SERIAL PRIMARY KEY")
-            
-            # Add version tracking columns if not already present
-            if 'created_at' not in df.columns:
-                columns.append("created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-            if 'updated_at' not in df.columns:
-                columns.append("updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-            
-            # Create table
-            create_table_query = f"CREATE TABLE {table_name} ({', '.join(columns)});"
-            cursor.execute(create_table_query)
-            
-            try:
-                # Create indexes for efficient lookups
-                # Assume the first column that's not country is the primary data identifier (like time or date)
-                identifier_col = next((col for col in df.columns if col != 'country'), 'date')
-                cursor.execute(f"CREATE INDEX idx_{table_name}_{identifier_col} ON {table_name} (\"{identifier_col}\")")
-            except Exception as e:
-                print(f"Warning: Could not create index: {e}")
-            
-            conn.commit()
-            print(f"Created new table '{table_name}' with indexes")
-        else:
-            # Get existing columns in all cases (whether table existed or was just created)
-            cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table_name}'")
-            existing_columns = [row[0] for row in cursor.fetchall()]
-        
+        # If table exists, drop it
         if table_exists:
-            # Table exists, check for any new columns in the dataframe
-            for col_name, dtype in zip(df.columns, df.dtypes):
-                if col_name.lower() not in [col.lower() for col in existing_columns]:
-                    # Map pandas dtypes to PostgreSQL types
-                    if 'int' in str(dtype):
-                        pg_type = 'INTEGER'
-                    elif 'float' in str(dtype):
-                        pg_type = 'FLOAT'
-                    elif 'datetime' in str(dtype):
-                        pg_type = 'TIMESTAMP'
-                    else:
-                        pg_type = 'TEXT'
-                    
-                    # Add the new column
-                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN \"{col_name}\" {pg_type}")
-                    conn.commit()
-                    print(f"Added new column '{col_name}' to table '{table_name}'")
-                    
-            # Refresh existing columns list after potential changes
-            cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table_name}'")
-            existing_columns = [row[0] for row in cursor.fetchall()]
+            cursor.execute(f"DROP TABLE {table_name}")
+            conn.commit()
+            print(f"Dropped existing table '{table_name}'")
         
-        # Determine the unique identifier for this data
-        # This assumes your energy data has some form of timestamp or period identifier
-        id_column = next((col for col in df.columns if col.lower() in ['id', 'date', 'timestamp', 'period', 'time']), None)
+        # Create table with the new data
+        # Get column names and types from DataFrame
+        columns = []
+        for col_name, dtype in zip(df.columns, df.dtypes):
+            # Map pandas dtypes to PostgreSQL types
+            if 'int' in str(dtype):
+                pg_type = 'INTEGER'
+            elif 'float' in str(dtype):
+                pg_type = 'FLOAT'
+            elif 'datetime' in str(dtype):
+                pg_type = 'TIMESTAMP'
+            else:
+                pg_type = 'TEXT'
+            columns.append(f"\"{col_name}\" {pg_type}")
+        
+        # Add a unique identifier column for updates if not already present
+        if 'id' not in df.columns:
+            columns.append("id SERIAL PRIMARY KEY")
+        
+        # Add version tracking columns if not already present
+        if 'created_at' not in df.columns:
+            columns.append("created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        if 'updated_at' not in df.columns:
+            columns.append("updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        
+        # Create table
+        create_table_query = f"CREATE TABLE {table_name} ({', '.join(columns)});"
+        cursor.execute(create_table_query)
         
         try:
-            if id_column:
-                # For each row, try to update existing records, or insert new ones
-                for _, row in df.iterrows():
-                    try:
-                        # Check if this record already exists
-                        id_value = row[id_column]
-                        cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE \"{id_column}\" = %s", (id_value,))
-                        exists = cursor.fetchone()[0] > 0
-                        
-                        if exists:
-                            # Update existing record
-                            set_clauses = []
-                            values = []
-                            
-                            for col, val in row.items():
-                                if col != id_column and col in existing_columns:
-                                    set_clauses.append(f"\"{col}\" = %s")
-                                    values.append(val)
-                            
-                            # Only proceed if there are columns to update
-                            if set_clauses:
-                                # Add updated_at timestamp if the column exists
-                                if "updated_at" in existing_columns:
-                                    set_clauses.append("updated_at = CURRENT_TIMESTAMP")
-                                
-                                # Add the id value for the WHERE clause
-                                values.append(id_value)
-                                
-                                # Execute update
-                                update_query = f"UPDATE {table_name} SET {', '.join(set_clauses)} WHERE \"{id_column}\" = %s"
-                                cursor.execute(update_query, values)
-                        else:
-                            # Insert new record
-                            columns = [col for col in row.index if col.lower() in [col.lower() for col in existing_columns]]
-                            if columns:
-                                placeholders = ', '.join(['%s'] * len(columns))
-                                values = [row[col] for col in columns]
-                                
-                                # Insert data
-                                columns_str = ', '.join([f'"{col}"' for col in columns])
-                                insert_query = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
-                                cursor.execute(insert_query, values)
-                    except Exception as row_error:
-                        print(f"Warning: Error processing row for {id_column}={row.get(id_column, 'unknown')}: {row_error}")
-                        # Continue processing other rows
-            else:
-                # No suitable ID column found - we'll treat all data as new records
-                print(f"Warning: No suitable ID column found for incremental updates in '{table_name}'. Adding all as new records.")
-                
-                # Generate values part of the SQL query
-                for _, row in df.iterrows():
-                    try:
-                        columns = [col for col in row.index if col.lower() in [col.lower() for col in existing_columns]]
-                        if columns:
-                            placeholders = ', '.join(['%s'] * len(columns))
-                            values = [row[col] for col in columns]
-                            
-                            # Insert data
-                            columns_str = ', '.join([f'"{col}"' for col in columns])
-                            insert_query = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
-                            cursor.execute(insert_query, values)
-                    except Exception as row_error:
-                        print(f"Warning: Error inserting row: {row_error}")
-                        # Continue processing other rows
+            # Create indexes for efficient lookups
+            # Assume the first column that's not country is the primary data identifier (like time or date)
+            identifier_col = next((col for col in df.columns if col != 'country'), 'date')
+            cursor.execute(f"CREATE INDEX idx_{table_name}_{identifier_col} ON {table_name} (\"{identifier_col}\")")
         except Exception as e:
-            print(f"Error processing data for table {table_name}: {e}")
-            # Continue processing other country groups
+            print(f"Warning: Could not create index: {e}")
         
         conn.commit()
-        print(f"Incremental update for country '{country}' completed to table '{table_name}'")
+        print(f"Created new table '{table_name}' with indexes")
+        
+        # Insert all data into the table
+        try:
+            # Get the columns in the table
+            cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table_name}'")
+            existing_columns = [row[0] for row in cursor.fetchall()]
+            
+            # Filter columns that exist in the table
+            valid_columns = [col for col in df.columns if col.lower() in [col.lower() for col in existing_columns]]
+            
+            if valid_columns:
+                # Insert data in bulk
+                print(f"Inserting {len(df)} rows into {table_name}")
+                
+                # Prepare values list for all rows
+                values_list = []
+                for _, row in df.iterrows():
+                    row_values = [row[col] for col in valid_columns]
+                    values_list.append(row_values)
+                
+                # Create the SQL for bulk insert
+                placeholders = ', '.join(['%s'] * len(valid_columns))
+                columns_str = ', '.join([f'"{col}"' for col in valid_columns])
+                
+                # Use executemany for efficient bulk insert
+                insert_query = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
+                cursor.executemany(insert_query, values_list)
+                conn.commit()
+                
+        except Exception as e:
+            print(f"Error inserting data into table {table_name}: {e}")
+            # Continue processing other country groups
+        
+        print(f"Data loaded for country '{country}' into table '{table_name}'")
     
     cursor.close()
     conn.close()
     
-    print("All country data incrementally updated successfully")
+    print("All country data uploaded successfully")
 
 
 # Define the DAG
